@@ -1,83 +1,65 @@
 import torch.nn as nn
 import time
 import torch
+import sklearn.metrics import accuracy_score
 
-
-loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+# loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 # Reusable component generates loss and logits from embedding and classifier
-def compute_logits_loss(bert, model, input_ids, attention_mask, labels):
-    outputs = bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True
-    )
+def compute_logits_loss(bert, model, criterion, input_ids, attention_mask, labels):
+    outputs = bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
     logits = model(outputs.last_hidden_state, outputs.pooler_output)
-    loss = loss_fn(logits, labels)
+    loss = criterion(logits, labels)
 
     return logits, loss
-    
 
-# Calculates loss and logits 
-def getPredicts(bert, model, optimizer, train_dataloader, is_train=True):
-    total_loss, correct, total = 0, 0,0
-    # make the batch dataloader
-    for i, batching in enumerate(train_dataloader):
-        # Connect the token embedding to device
-        input_ids, attention_mask, labels = batching
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        labels = labels.to(device)
-        
-        # This section will be trainable if it's True returns zero grad to accumulate the predictions
-        # False would become model.eval() just for validation dataset exists for handling overfitting
-        if is_train:
-            accumulation_step = 4
-            optimizer.zero_grad()
-            logits, loss = compute_logits_loss(bert, model, input_ids, attention_mask, labels)
-            loss = loss / accumulation_step
-            loss.backward()
-            optimizer.step()
 
-            # Optimize every accumulation step from batching dataset
-            if (i + 1) % accumulation_step == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-        else:
-            logits, loss = compute_logits_loss(bert, model, input_ids, attention_mask, labels)
+def train(bert, model, criterion, optimizer, dataloader):
+    model.to(device)
+    bert.to(device)
 
-        # compute loss and accuracy 
+    model.train()
+    bert.train()
+
+    total_loss, correct = 0, 0
+    for _, batch in enumerate(dataloader):
+        input_ids, attention_mask, labels = batch
+        input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+        logits, loss = compute_logits_loss(
+            bert, model, criterion, input_ids, attention_mask, labels
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
         total_loss += loss.item() * labels.size(0)
-        preds = torch.argmax(logits, dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+        predict = torch.argmax(logits, dim=1)
+        correct += accuracy_score(predict, labels)
 
-    epoch_train_loss = total_loss / total
-    epoch_train_acc = 100 * correct / total
+def eval(bert, model, criterion, dataloader):
+    model.to(device)
+    bert.to(device)
 
-    return epoch_train_loss, epoch_train_acc
+    model.eval()
+    bert.eval()
 
-def train(bert, model, optimizer, train_dataloader, val_dataloader=None, epochs=2):
-    train_losses, train_accs, val_losses, val_accs = [], [], [], []
-    for epoch in range(epochs):
-        t0 = time.time()
-        bert.train()
-        model.train()
+    all_preds, true_labels = [], []
+    total_loss, total = 0, 0
+    with torch.no_grad():
+        for _, batch in enumerate(dataloader):
+            inputs, attention_mask,labels = batch
+            inputs, attention_mask, labels = inputs.to(device), attention_mask.to(device), labels.to(device)
 
-        train_loss, train_acc = getPredicts(bert, model, optimizer, train_dataloader)
-        train_losses.append(train_loss)
-        train_accs.append(train_acc)
+            logits, loss = compute_logits_loss(bert, model, criterion, inputs, attention_mask, labels)
 
-        if val_dataloader:
-            bert.eval()
-            model.eval()
-            
-            with torch.no_grad():
-                val_loss, val_acc = getPredicts(bert, model, optimizer, val_dataloader, is_train=False)
-                val_losses.append(val_loss)
-                val_accs.append(val_acc)
-            print(f'Epochs: {epoch + 1} | Train Loss: {train_loss: .2f} | Train Acc: {train_acc: .4f} | Val Loss: {val_loss: .2f} | Val Acc: {val_acc: .4f} Times: {time.time() - t0: .2f}s')
+            total_loss += loss.item() * labels.size(0)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            total += labels.size(0)
 
-        else:
-            print(f'Epochs: {epoch + 1} | Train Loss: {train_loss: .2f} | Train Acc: {train_acc: .4f} | Times: {time.time() - t0: .2f}s')
+            all_preds.extend(preds)
+            true_labels.extend(labels.cpu().numpy())
+
+    return total_loss / total, all_preds, true_labels
